@@ -8,8 +8,8 @@ from core.embedder import embed_query, embed_single_query
 from core.graph import get_graph_description
 from config import (
     DEFAULT_TOP_K,
-    SEARCH_SCORE_THRESHOLD_HIGH,
     SEARCH_SCORE_THRESHOLD_LOW,
+    SEARCH_SCORE_RELATIVE_CUTOFF,
     SEARCH_MAX_CANDIDATES_PER_LEVEL,
     SEARCH_LLM_AMBIGUITY_RANGE,
 )
@@ -239,44 +239,51 @@ def _select_candidates(
 ) -> list[dict]:
     """Apply threshold routing to select which candidates to descend into.
 
-    Uses score thresholds with LLM fallback for ambiguous cases.
+    Scoring strategy:
+    1. Drop anything below the absolute floor (SEARCH_SCORE_THRESHOLD_LOW).
+    2. Apply relative cutoff — must score >= RELATIVE_CUTOFF * top_score.
+       This adapts to the actual score distribution instead of fixed thresholds.
+    3. If remaining scores are tightly clustered (ambiguous), ask the LLM.
+    4. Cap at MAX_CANDIDATES_PER_LEVEL.
     """
     if not candidates:
         return []
 
-    scores = [c["score"] for c in candidates]
-    max_score = max(scores)
-    min_score = min(scores)
+    max_score = max(c["score"] for c in candidates)
 
-    # Filter to candidates above the low threshold
+    # Step 1: absolute floor
     viable = [c for c in candidates if c["score"] >= SEARCH_SCORE_THRESHOLD_LOW]
     if not viable:
-        # Nothing above threshold — take the single best anyway
         return [candidates[0]]
 
-    # If scores are tightly clustered (ambiguous), use LLM routing
-    if max_score - min_score <= SEARCH_LLM_AMBIGUITY_RANGE and len(viable) > 1:
-        try:
-            from core.llm import llm_route_search
-            selected_ids = llm_route_search(query, viable)
-            selected = [c for c in viable if c["id"] in selected_ids]
-            if selected:
-                return selected[:SEARCH_MAX_CANDIDATES_PER_LEVEL]
-        except Exception:
-            pass  # Fall through to threshold-based selection
+    # Step 2: relative cutoff — must be within range of the best score
+    relative_floor = max_score * SEARCH_SCORE_RELATIVE_CUTOFF
+    strong = [c for c in viable if c["score"] >= relative_floor]
+    if not strong:
+        strong = [viable[0]]  # at least keep the best
 
-    # Take candidates above high threshold, or top N if none are that high
-    high = [c for c in viable if c["score"] >= SEARCH_SCORE_THRESHOLD_HIGH]
-    if high:
-        return high[:SEARCH_MAX_CANDIDATES_PER_LEVEL]
+    # Step 3: if scores are tightly clustered among the strong set, use LLM
+    if len(strong) > 1:
+        strong_scores = [c["score"] for c in strong]
+        if max(strong_scores) - min(strong_scores) <= SEARCH_LLM_AMBIGUITY_RANGE:
+            try:
+                from core.llm import llm_route_search
+                selected_ids = llm_route_search(query, strong)
+                selected = [c for c in strong if c["id"] in selected_ids]
+                if selected:
+                    return selected[:SEARCH_MAX_CANDIDATES_PER_LEVEL]
+            except Exception:
+                pass
 
-    return viable[:SEARCH_MAX_CANDIDATES_PER_LEVEL]
+    # Step 4: cap
+    return strong[:SEARCH_MAX_CANDIDATES_PER_LEVEL]
 
 
 def graph_search(
     query: str,
     top_k: int = DEFAULT_TOP_K,
-) -> list[dict]:
+    verbose: bool = False,
+) -> tuple[list[dict], list[dict]] | list[dict]:
     """Navigate the DAG level by level to find relevant leaf nodes.
 
     1. Embed query as both single-vector and multi-vector
@@ -284,15 +291,22 @@ def graph_search(
     3. Threshold routing to pick candidates at each level
     4. Descend until reaching leaves
     5. Score leaves with MaxSim, return top-k with highlights
+
+    If verbose=True, returns (results, trace) where trace is a list of
+    traversal steps: [{depth, action, nodes: [{id, name, score, selected}]}]
     """
+    trace: list[dict] = []
     roots = get_roots()
     if not roots:
-        return []
+        return ([], trace) if verbose else []
 
     # Check if any roots have embeddings — if not, fall back to flat search
     roots_with_embeddings = [r for r in roots if r.get("embedding_type")]
     if not roots_with_embeddings:
-        return flat_search(query, top_k=top_k)
+        results = flat_search(query, top_k=top_k)
+        if verbose:
+            trace.append({"depth": 0, "action": "fallback_to_flat", "nodes": []})
+        return (results, trace) if verbose else results
 
     # Embed query in both modes
     query_single = embed_single_query(query)
@@ -304,6 +318,7 @@ def graph_search(
 
     visited = set()
     max_depth = 10  # safety limit
+    depth = 0
 
     for _ in range(max_depth):
         if not current_level:
@@ -317,14 +332,10 @@ def graph_search(
             visited.add(node["id"])
 
             if not node.get("embedding_type"):
-                # No embedding — descend into children blindly
                 children = get_children(node["id"])
                 for child in children:
                     if child.get("embedding_type"):
                         scored_nodes.append({**child, "score": 0.5})
-                    else:
-                        # Leaf without embedding — can't score, skip
-                        pass
                 continue
 
             score = score_node(query_single, query_multi, node["id"], node["embedding_type"])
@@ -338,22 +349,48 @@ def graph_search(
         for node in scored_nodes:
             children = get_children(node["id"])
             if not children:
-                # Leaf node — collect for final scoring
                 leaf_candidates.append((node, node["score"]))
             else:
                 next_level.append(node)
 
         # Select which branch nodes to descend into
+        selected_ids = set()
         if next_level:
             next_level.sort(key=lambda x: x["score"], reverse=True)
             selected = _select_candidates(query, next_level)
+            selected_ids = {n["id"] for n in selected}
 
-            # Get children of selected nodes for next iteration
+            # Record trace for this level
+            if verbose:
+                trace_nodes = []
+                for node in sorted(scored_nodes, key=lambda x: x["score"], reverse=True):
+                    children = get_children(node["id"])
+                    is_leaf = not children
+                    trace_nodes.append({
+                        "id": node["id"],
+                        "name": node["name"],
+                        "type": node.get("node_type", ""),
+                        "score": round(node["score"], 4),
+                        "selected": node["id"] in selected_ids,
+                        "leaf": is_leaf,
+                    })
+                trace.append({"depth": depth, "action": "score_and_select", "nodes": trace_nodes})
+
             current_level = []
             for node in selected:
                 current_level.extend(get_children(node["id"]))
         else:
+            # Only leaves at this level
+            if verbose and leaf_candidates:
+                trace_nodes = [
+                    {"id": n["id"], "name": n["name"], "type": n.get("node_type", ""),
+                     "score": round(s, 4), "selected": True, "leaf": True}
+                    for n, s in leaf_candidates[-len(scored_nodes):]
+                ]
+                trace.append({"depth": depth, "action": "reached_leaves", "nodes": trace_nodes})
             current_level = []
+
+        depth += 1
 
     # Re-score leaf nodes with full MaxSim if they were scored with single-vector
     final_scored: list[tuple[dict, float]] = []
@@ -382,7 +419,6 @@ def graph_search(
             "token_count": leaf.get("token_count", 0),
         }
 
-        # Only do word highlighting for multi-vector leaves
         if leaf.get("embedding_type") == "multi" and leaf.get("text"):
             doc_vectors = load_vectors(leaf["id"])
             result["highlights"] = word_relevance(leaf["text"], query, query_multi, doc_vectors)
@@ -391,4 +427,4 @@ def graph_search(
 
         results.append(result)
 
-    return results
+    return (results, trace) if verbose else results

@@ -209,12 +209,63 @@ def cmd_ingest_ticker(args: argparse.Namespace) -> None:
     _print_ingest(result)
 
 
+def _print_trace(trace: list[dict]) -> None:
+    """Print graph traversal trace."""
+    DIM = "\033[2m"
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+    CYAN = "\033[36m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+    print(f"\n{BOLD}Graph traversal:{RESET}")
+    for step in trace:
+        depth = step["depth"]
+        action = step["action"]
+        indent = "  " * depth
+
+        if action == "fallback_to_flat":
+            print(f"{indent}{DIM}(no embeddings on roots, falling back to flat search){RESET}")
+            continue
+
+        label = f"Level {depth}" if action == "score_and_select" else f"Level {depth} (leaves)"
+        print(f"\n{indent}{BOLD}{label}{RESET}")
+
+        for node in step["nodes"]:
+            score_str = f"{node['score']:.4f}"
+            name = node["name"]
+            ntype = node.get("type", "")
+
+            if node.get("leaf"):
+                marker = f"{CYAN}\u2514\u2500 leaf{RESET}"
+            elif node.get("selected"):
+                marker = f"{GREEN}\u2714 descend{RESET}"
+            else:
+                marker = f"{RED}\u2718 skip{RESET}"
+
+            print(f"{indent}  {marker}  {score_str}  [{ntype}] {name}")
+
+    print()
+
+
 def cmd_search(args: argparse.Namespace) -> None:
-    results = service.search_documents(
-        query=args.query,
-        top_k=args.top_k,
-        flat=args.flat,
-    )
+    verbose = getattr(args, "verbose", False) and not args.flat
+
+    if verbose:
+        results, trace = service.search_documents(
+            query=args.query,
+            top_k=args.top_k,
+            flat=args.flat,
+            verbose=True,
+        )
+        _print_trace(trace)
+    else:
+        results = service.search_documents(
+            query=args.query,
+            top_k=args.top_k,
+            flat=args.flat,
+        )
+
     _print_search(results)
 
 
@@ -243,6 +294,34 @@ def cmd_graph(args: argparse.Namespace) -> None:
 def cmd_enrich(args: argparse.Namespace) -> None:
     count = service.enrich_graph(node_id=args.node)
     print(f"Enriched {count} nodes with summaries and embeddings.")
+
+
+def cmd_ingest_url(args: argparse.Namespace) -> None:
+    callback = None if args.autonomous else _cli_confirm_callback
+    result = service.ingest_url(args.url, confirm_callback=callback)
+    _print_ingest(result)
+
+
+def cmd_ingest_feed(args: argparse.Namespace) -> None:
+    results = service.ingest_feed(
+        args.feed_url,
+        max_articles=args.max_articles,
+        confirm_callback=None,  # batch is always autonomous per-article
+    )
+    ingested = [r for r in results if r.node_id != -1]
+    skipped = len(results) - len(ingested)
+    print(f"\nDone. Ingested {len(ingested)} articles ({skipped} skipped).")
+
+
+def cmd_ingest_feeds(args: argparse.Namespace) -> None:
+    results = service.ingest_all_feeds(
+        args.feeds_file,
+        max_articles=args.max_articles,
+        confirm_callback=None,
+    )
+    ingested = [r for r in results if r.node_id != -1]
+    skipped = len(results) - len(ingested)
+    print(f"\nDone. Ingested {len(ingested)} articles total ({skipped} skipped).")
 
 
 def cmd_migrate(args: argparse.Namespace) -> None:
@@ -283,6 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Number of results (default: 5)")
     p_search.add_argument("--flat", action="store_true",
                           help="Use flat search (no graph navigation)")
+    p_search.add_argument("--verbose", "-v", action="store_true",
+                          help="Show graph traversal trace")
     p_search.set_defaults(func=cmd_search)
 
     # list
@@ -308,6 +389,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_enrich.add_argument("--node", type=int, default=None,
                           help="Enrich only a specific subtree")
     p_enrich.set_defaults(func=cmd_enrich)
+
+    # ingest-url
+    p_url = subparsers.add_parser("ingest-url", help="Ingest a web page by URL")
+    p_url.add_argument("url", help="URL of the web page to ingest")
+    p_url.add_argument("--autonomous", action="store_true",
+                        help="Skip interactive confirmations")
+    p_url.set_defaults(func=cmd_ingest_url)
+
+    # ingest-feed
+    p_feed = subparsers.add_parser("ingest-feed", help="Ingest articles from an RSS feed")
+    p_feed.add_argument("feed_url", help="URL of the RSS/Atom feed")
+    p_feed.add_argument("--max-articles", type=int, default=None,
+                         help="Max articles to ingest (default: config value)")
+    p_feed.set_defaults(func=cmd_ingest_feed)
+
+    # ingest-feeds
+    p_feeds = subparsers.add_parser("ingest-feeds",
+                                     help="Ingest all feeds from a JSON file")
+    p_feeds.add_argument("feeds_file", help="Path to feeds JSON file")
+    p_feeds.add_argument("--max-articles", type=int, default=None,
+                          help="Max articles per feed (default: config value)")
+    p_feeds.set_defaults(func=cmd_ingest_feeds)
 
     # migrate
     p_migrate = subparsers.add_parser("migrate",

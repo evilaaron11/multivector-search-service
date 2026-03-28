@@ -11,7 +11,7 @@ from typing import Callable
 
 import numpy as np
 
-from core import store, chunker, embedder, searcher, edgar_fetcher
+from core import store, chunker, embedder, searcher, edgar_fetcher, web_fetcher
 from core.llm import (
     generate_node_summary,
     generate_leaf_description,
@@ -328,6 +328,207 @@ def ingest_ticker(
 
 
 # ---------------------------------------------------------------------------
+# Web ingestion
+# ---------------------------------------------------------------------------
+
+def ingest_url(
+    url: str,
+    source_name: str | None = None,
+    confirm_callback: ConfirmCallback | None = None,
+) -> IngestResult:
+    """Fetch a web page, extract content, embed, and store in the DAG."""
+    store.init_db()
+
+    # Fast URL-based dedup
+    existing = store.find_node_by_source_url(url)
+    if existing:
+        return IngestResult(
+            node_id=-1, name=existing["name"], num_chunks=0, sections=[],
+        )
+
+    chunks, metadata = web_fetcher.process_url(url, source_name=source_name)
+    title = metadata.get("title", "Untitled")
+    name = f"{source_name}: {title}" if source_name else title
+
+    chunk_texts = [c["text"] for c in chunks]
+    full_text = "\n\n".join(chunk_texts[:5])
+
+    doc_summary = generate_leaf_description(full_text)
+    description = f"Source: {url}\n\n{doc_summary}"
+    summary_vector = embedder.embed_single_vector([doc_summary])[0]
+
+    if _check_duplicates(doc_summary, summary_vector):
+        return IngestResult(node_id=-1, name=name, num_chunks=0, sections=[])
+
+    parent_id = _find_best_parent(doc_summary, summary_vector, confirm_callback)
+
+    doc_node_id = store.insert_node(
+        node_type="document",
+        name=name,
+        description=description,
+        embedding_type="single",
+    )
+    store.save_vectors(doc_node_id, summary_vector)
+
+    is_new_branch = False
+    if parent_id is not None:
+        store.insert_edge(parent_id, doc_node_id)
+        parent = store.get_node(parent_id)
+        if parent and parent["node_type"] == "category":
+            is_new_branch = True
+
+    embeddings = embedder.embed_documents(chunk_texts)
+
+    seen_sections: set[str] = set()
+    sections: list[str] = []
+    for i, chunk in enumerate(chunks):
+        chunk_node_id = store.insert_node(
+            node_type="chunk",
+            name=f"{chunk['section']} (chunk {chunk['chunk_index']})",
+            text=chunk["text"],
+            embedding_type="multi",
+            token_count=chunk["token_count"],
+        )
+        store.save_vectors(chunk_node_id, embeddings[i])
+        store.insert_edge(doc_node_id, chunk_node_id, sort_order=chunk["chunk_index"])
+
+        sec = chunk["section"]
+        if sec not in seen_sections:
+            seen_sections.add(sec)
+            sections.append(sec)
+
+    update_ancestor_summaries(doc_node_id)
+
+    return IngestResult(
+        node_id=doc_node_id,
+        name=name,
+        num_chunks=len(chunks),
+        sections=sections,
+        parent_node_id=parent_id,
+        is_new_branch=is_new_branch,
+    )
+
+
+def ingest_feed(
+    feed_url: str,
+    feed_name: str | None = None,
+    max_articles: int | None = None,
+    confirm_callback: ConfirmCallback | None = None,
+) -> list[IngestResult]:
+    """Fetch all articles from an RSS feed and ingest them."""
+    store.init_db()
+
+    articles = web_fetcher.process_feed(feed_url, feed_name=feed_name, max_articles=max_articles)
+    results: list[IngestResult] = []
+
+    for i, (chunks, metadata) in enumerate(articles):
+        url = metadata.get("url", "")
+        title = metadata.get("title", "Untitled")
+        source = metadata.get("source_name", "")
+        print(f"  [{i+1}/{len(articles)}] Ingesting: {title}")
+
+        # URL dedup
+        existing = store.find_node_by_source_url(url)
+        if existing:
+            print(f"    Skipped (already ingested)")
+            results.append(IngestResult(
+                node_id=-1, name=existing["name"], num_chunks=0, sections=[],
+            ))
+            continue
+
+        name = f"{source}: {title}" if source else title
+        chunk_texts = [c["text"] for c in chunks]
+        full_text = "\n\n".join(chunk_texts[:5])
+
+        try:
+            doc_summary = generate_leaf_description(full_text)
+            description = f"Source: {url}\n\n{doc_summary}"
+            summary_vector = embedder.embed_single_vector([doc_summary])[0]
+
+            if _check_duplicates(doc_summary, summary_vector):
+                print(f"    Skipped (duplicate content)")
+                results.append(IngestResult(node_id=-1, name=name, num_chunks=0, sections=[]))
+                continue
+
+            parent_id = _find_best_parent(doc_summary, summary_vector, confirm_callback=None)
+
+            doc_node_id = store.insert_node(
+                node_type="document",
+                name=name,
+                description=description,
+                embedding_type="single",
+            )
+            store.save_vectors(doc_node_id, summary_vector)
+
+            is_new_branch = False
+            if parent_id is not None:
+                store.insert_edge(parent_id, doc_node_id)
+                parent = store.get_node(parent_id)
+                if parent and parent["node_type"] == "category":
+                    is_new_branch = True
+
+            embeddings = embedder.embed_documents(chunk_texts)
+
+            seen_sections: set[str] = set()
+            sections: list[str] = []
+            for j, chunk in enumerate(chunks):
+                chunk_node_id = store.insert_node(
+                    node_type="chunk",
+                    name=f"{chunk['section']} (chunk {chunk['chunk_index']})",
+                    text=chunk["text"],
+                    embedding_type="multi",
+                    token_count=chunk["token_count"],
+                )
+                store.save_vectors(chunk_node_id, embeddings[j])
+                store.insert_edge(doc_node_id, chunk_node_id, sort_order=chunk["chunk_index"])
+
+                sec = chunk["section"]
+                if sec not in seen_sections:
+                    seen_sections.add(sec)
+                    sections.append(sec)
+
+            update_ancestor_summaries(doc_node_id)
+
+            results.append(IngestResult(
+                node_id=doc_node_id,
+                name=name,
+                num_chunks=len(chunks),
+                sections=sections,
+                parent_node_id=parent_id,
+                is_new_branch=is_new_branch,
+            ))
+        except Exception as e:
+            print(f"    Error: {e}")
+            results.append(IngestResult(node_id=-1, name=name, num_chunks=0, sections=[]))
+
+    return results
+
+
+def ingest_all_feeds(
+    feeds_file: str,
+    max_articles: int | None = None,
+    confirm_callback: ConfirmCallback | None = None,
+) -> list[IngestResult]:
+    """Load a feeds JSON file and ingest all feeds."""
+    feeds = web_fetcher.load_feeds_file(feeds_file)
+    all_results: list[IngestResult] = []
+
+    for feed in feeds:
+        feed_url = feed["url"]
+        feed_name = feed.get("name")
+        print(f"\nProcessing feed: {feed_name or feed_url}")
+        results = ingest_feed(
+            feed_url,
+            feed_name=feed_name,
+            max_articles=max_articles,
+            confirm_callback=confirm_callback,
+        )
+        all_results.extend(results)
+
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # Summary propagation
 # ---------------------------------------------------------------------------
 
@@ -426,7 +627,8 @@ def search_documents(
     top_k: int = 5,
     flat: bool = False,
     node_id: int | None = None,
-) -> list[SearchResult]:
+    verbose: bool = False,
+) -> tuple[list[SearchResult], list[dict]] | list[SearchResult]:
     """Search ingested documents and return ranked results.
 
     Args:
@@ -434,15 +636,19 @@ def search_documents(
         top_k: Number of results to return.
         flat: If True, use flat search (no graph navigation).
         node_id: If set with flat search, restrict to leaves under this node.
+        verbose: If True, return (results, trace) with traversal info.
     """
     store.init_db()
 
+    trace: list[dict] = []
     if flat:
         raw_results = searcher.flat_search(query, top_k=top_k, node_id=node_id)
+    elif verbose:
+        raw_results, trace = searcher.graph_search(query, top_k=top_k, verbose=True)
     else:
         raw_results = searcher.graph_search(query, top_k=top_k)
 
-    return [
+    results = [
         SearchResult(
             node_id=r["node_id"],
             score=r["score"],
@@ -453,6 +659,8 @@ def search_documents(
         )
         for r in raw_results
     ]
+
+    return (results, trace) if verbose else results
 
 
 # ---------------------------------------------------------------------------

@@ -29,13 +29,19 @@ CLAUDE_CLI_PATH = "claude"
 DEFAULT_TOP_K = 5
 
 # Search routing thresholds
-SEARCH_SCORE_THRESHOLD_HIGH = 0.75
-SEARCH_SCORE_THRESHOLD_LOW = 0.40
-SEARCH_MAX_CANDIDATES_PER_LEVEL = 5
-SEARCH_LLM_AMBIGUITY_RANGE = 0.15
+SEARCH_SCORE_THRESHOLD_LOW = 0.30       # absolute floor — ignore below this
+SEARCH_SCORE_RELATIVE_CUTOFF = 0.70     # must score >= 70% of the top score
+SEARCH_MAX_CANDIDATES_PER_LEVEL = 3
+SEARCH_LLM_AMBIGUITY_RANGE = 0.10      # if top scores within this range, ask LLM
 
 # Ingestion dedup
 DEDUP_SIMILARITY_THRESHOLD = 0.92
+
+# Web/RSS ingestion
+RSS_FETCH_DELAY = 1.0
+RSS_REQUEST_TIMEOUT = 15
+RSS_MAX_ARTICLES_PER_FEED = 20
+RSS_MIN_ARTICLE_WORDS = 100
 
 
 def get_jina_api_key() -> str:

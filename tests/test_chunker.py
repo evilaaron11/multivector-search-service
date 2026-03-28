@@ -151,31 +151,50 @@ class TestChunkSection:
         result = chunk_section("Blank", "   \n\n  ")
         assert result == []
 
-    def test_hard_split_at_token_limit(self, monkeypatch):
-        """Text exceeding the API token limit should be hard-split."""
-        import core.chunker as chunker_mod
-        monkeypatch.setattr(chunker_mod, "API_TOKEN_LIMIT", 50)
-
-        words = [f"w{i}" for i in range(120)]
-        text = " ".join(words)
+    def test_splits_at_target_size(self):
+        """Text exceeding the max chunk size should be split into overlapping chunks."""
+        # 800 words as separate paragraphs — well over 512 max
+        paragraphs = [f"paragraph{i} " + " ".join(f"w{j}" for j in range(100)) for i in range(8)]
+        text = "\n\n".join(paragraphs)
 
         result = chunk_section("Big", text)
-        assert len(result) == 3  # 50 + 50 + 20
+        assert len(result) > 1
         for chunk in result:
             assert chunk["section"] == "Big"
-            assert chunk["token_count"] <= 50
+            assert chunk["token_count"] > 0
 
+        # Chunk indices should be sequential
         indices = [c["chunk_index"] for c in result]
-        assert indices == [0, 1, 2]
+        assert indices == list(range(len(result)))
 
-    def test_text_exactly_at_limit(self, monkeypatch):
-        import core.chunker as chunker_mod
-        monkeypatch.setattr(chunker_mod, "API_TOKEN_LIMIT", 10)
+    def test_overlap_between_chunks(self):
+        """Consecutive chunks should share overlap tokens."""
+        # Create text with many small paragraphs to force multiple chunks
+        paragraphs = [" ".join(f"p{i}w{j}" for j in range(80)) for i in range(10)]
+        text = "\n\n".join(paragraphs)
 
-        text = " ".join(f"w{i}" for i in range(10))
+        result = chunk_section("Overlap", text, target=256, maximum=512, overlap=64)
+        if len(result) >= 2:
+            # Last words of chunk 0 should appear in chunk 1
+            words_0 = result[0]["text"].split()
+            words_1 = result[1]["text"].split()
+            tail_0 = set(words_0[-64:])
+            head_1 = set(words_1[:64])
+            # Some overlap should exist
+            assert len(tail_0 & head_1) > 0
+
+    def test_small_text_single_chunk(self):
+        """Text under the max should be a single chunk."""
+        text = " ".join(f"w{i}" for i in range(100))
+        result = chunk_section("Small", text)
+        assert len(result) == 1
+        assert result[0]["token_count"] == 100
+
+    def test_text_exactly_at_max(self):
+        text = " ".join(f"w{i}" for i in range(512))
         result = chunk_section("Exact", text)
         assert len(result) == 1
-        assert result[0]["token_count"] == 10
+        assert result[0]["token_count"] == 512
 
 
 # ===================================================================

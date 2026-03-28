@@ -289,12 +289,13 @@ class TestSelectCandidates:
         assert len(result) == 1
         assert result[0]["id"] == 1
 
-    def test_takes_high_threshold_candidates(self):
+    def test_relative_cutoff_filters_weak_candidates(self):
+        """Candidates far below the top score (< 70% of best) should be filtered."""
         from core.searcher import _select_candidates
         candidates = [
             {"id": 1, "name": "A", "score": 0.9},
             {"id": 2, "name": "B", "score": 0.8},
-            {"id": 3, "name": "C", "score": 0.3},
+            {"id": 3, "name": "C", "score": 0.3},  # 0.3 < 0.9 * 0.70 = 0.63
         ]
         result = _select_candidates("query", candidates)
         result_ids = {c["id"] for c in result}
@@ -308,12 +309,13 @@ class TestSelectCandidates:
 
     def test_respects_max_candidates(self):
         from core.searcher import _select_candidates
+        # All scores close together so relative cutoff doesn't filter them
         candidates = [
-            {"id": i, "name": f"N{i}", "score": 0.9 - i * 0.01}
+            {"id": i, "name": f"N{i}", "score": 0.90 - i * 0.005}
             for i in range(20)
         ]
         result = _select_candidates("query", candidates)
-        assert len(result) <= 5
+        assert len(result) <= 3  # SEARCH_MAX_CANDIDATES_PER_LEVEL
 
     @patch("core.llm.subprocess.run")
     def test_llm_fallback_on_ambiguous_scores(self, mock_run):
@@ -330,6 +332,8 @@ class TestSelectCandidates:
             {"id": 1, "name": "A", "description": "desc", "score": 0.50},
             {"id": 2, "name": "B", "description": "desc", "score": 0.55},
         ]
+        # Both above LOW (0.30), both above relative cutoff (0.55*0.70=0.385),
+        # gap 0.05 < AMBIGUITY_RANGE (0.10), so LLM should be called
         result = _select_candidates("query", candidates)
         result_ids = [c["id"] for c in result]
         assert 2 in result_ids

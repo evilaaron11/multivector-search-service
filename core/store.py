@@ -411,6 +411,22 @@ def get_nodes_by_embedding_type(embedding_type: str) -> list[dict]:
         conn.close()
 
 
+def find_node_by_source_url(url: str) -> dict | None:
+    """Find a document node whose description starts with 'Source: {url}'.
+
+    Used for fast URL-based dedup before the more expensive embedding dedup.
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM nodes WHERE node_type = 'document' AND description LIKE ?",
+            (f"Source: {url}%",),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 def count_children(node_id: int) -> int:
     """Return the number of children for a node."""
     conn = _connect()
