@@ -119,7 +119,16 @@ def _print_search(results: list[service.SearchResult]) -> None:
 
 
 def _print_list_tree(nodes: list[service.NodeInfo]) -> None:
-    """Print nodes as a tree structure."""
+    """Print nodes as a condensed tree with box-drawing characters."""
+    DIM = "\033[2m"
+    BOLD = "\033[1m"
+    CYAN = "\033[36m"
+    YELLOW = "\033[33m"
+    GREEN = "\033[32m"
+    RESET = "\033[0m"
+
+    TYPE_COLORS = {"category": CYAN, "document": YELLOW, "chunk": GREEN}
+
     if not nodes:
         print("No nodes in the graph.")
         return
@@ -129,25 +138,51 @@ def _print_list_tree(nodes: list[service.NodeInfo]) -> None:
         print("No nodes in the graph.")
         return
 
-    def _walk(node_id: int, indent: str = "") -> None:
+    def _walk(node_id: int, prefix: str = "", is_last: bool = True, depth: int = 0) -> None:
         node = store.get_node(node_id)
         if not node:
             return
-        child_count = store.count_children(node_id)
-        desc = node.get("description", "")
-        desc_preview = f" -- {desc[:60]}..." if len(desc) > 60 else (f" -- {desc}" if desc else "")
 
-        type_tag = f"[{node['node_type']}]"
-        if child_count > 0:
-            print(f"{indent}{type_tag} {node['name']} ({child_count} children){desc_preview}")
-            children = store.get_children(node_id)
-            for child in children:
-                _walk(child["id"], indent + "  ")
+        children = store.get_children(node_id)
+        ntype = node["node_type"]
+        color = TYPE_COLORS.get(ntype, "")
+
+        # Connector characters
+        if depth == 0:
+            connector = ""
+            child_prefix = ""
         else:
-            print(f"{indent}{type_tag} {node['name']}{desc_preview}")
+            connector = "\u2514\u2500 " if is_last else "\u251c\u2500 "
+            child_prefix = prefix + ("   " if is_last else "\u2502  ")
 
-    for root in roots:
-        _walk(root["id"])
+        # Build the display line
+        type_tag = f"{color}{ntype}{RESET}"
+        name = node["name"]
+
+        if ntype == "chunk":
+            # For chunks, show condensed: just count them at parent level
+            return  # handled by parent
+        elif ntype == "document":
+            chunk_count = len(children)
+            line = f"{prefix}{connector}{type_tag} {BOLD}{name}{RESET} {DIM}({chunk_count} chunks){RESET}"
+            print(line)
+        else:  # category
+            doc_children = [c for c in children if c["node_type"] != "chunk"]
+            desc = node.get("description", "")
+            if desc.startswith("Source:"):
+                desc = desc.split("\n\n", 1)[1] if "\n\n" in desc else ""
+            desc_preview = f" {DIM}— {desc[:70]}...{RESET}" if len(desc) > 70 else (f" {DIM}— {desc}{RESET}" if desc else "")
+            line = f"{prefix}{connector}{type_tag} {BOLD}{name}{RESET}{desc_preview}"
+            print(line)
+
+            for i, child in enumerate(doc_children):
+                _walk(child["id"], child_prefix, is_last=(i == len(doc_children) - 1), depth=depth + 1)
+
+    for i, root in enumerate(roots):
+        if i > 0:
+            print()
+        _walk(root["id"], depth=0)
+
 
 
 def _print_list_flat(nodes: list[service.NodeInfo]) -> None:
@@ -199,13 +234,13 @@ def _cli_confirm_callback(question: str, options: list[dict]) -> int:
 
 def cmd_ingest(args: argparse.Namespace) -> None:
     callback = None if args.autonomous else _cli_confirm_callback
-    result = service.ingest_document(args.file_path, confirm_callback=callback)
+    result = service.ingest_document(args.file_path, confirm_callback=callback, force=args.force)
     _print_ingest(result)
 
 
 def cmd_ingest_ticker(args: argparse.Namespace) -> None:
     callback = None if args.autonomous else _cli_confirm_callback
-    result = service.ingest_ticker(args.ticker, confirm_callback=callback)
+    result = service.ingest_ticker(args.ticker, confirm_callback=callback, force=args.force)
     _print_ingest(result)
 
 
@@ -298,7 +333,7 @@ def cmd_enrich(args: argparse.Namespace) -> None:
 
 def cmd_ingest_url(args: argparse.Namespace) -> None:
     callback = None if args.autonomous else _cli_confirm_callback
-    result = service.ingest_url(args.url, confirm_callback=callback)
+    result = service.ingest_url(args.url, confirm_callback=callback, force=args.force)
     _print_ingest(result)
 
 
@@ -306,7 +341,8 @@ def cmd_ingest_feed(args: argparse.Namespace) -> None:
     results = service.ingest_feed(
         args.feed_url,
         max_articles=args.max_articles,
-        confirm_callback=None,  # batch is always autonomous per-article
+        confirm_callback=None,
+        force=args.force,
     )
     ingested = [r for r in results if r.node_id != -1]
     skipped = len(results) - len(ingested)
@@ -318,6 +354,7 @@ def cmd_ingest_feeds(args: argparse.Namespace) -> None:
         args.feeds_file,
         max_articles=args.max_articles,
         confirm_callback=None,
+        force=args.force,
     )
     ingested = [r for r in results if r.node_id != -1]
     skipped = len(results) - len(ingested)
@@ -344,6 +381,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("file_path", help="Path to the markdown file")
     p_ingest.add_argument("--autonomous", action="store_true",
                           help="Skip interactive confirmations")
+    p_ingest.add_argument("--force", action="store_true",
+                          help="Delete existing and re-ingest")
     p_ingest.set_defaults(func=cmd_ingest)
 
     # ingest-ticker
@@ -353,6 +392,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ticker.add_argument("ticker", help="Stock ticker symbol (e.g., AAPL)")
     p_ticker.add_argument("--autonomous", action="store_true",
                           help="Skip interactive confirmations")
+    p_ticker.add_argument("--force", action="store_true",
+                          help="Delete existing and re-ingest")
     p_ticker.set_defaults(func=cmd_ingest_ticker)
 
     # search
@@ -395,6 +436,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_url.add_argument("url", help="URL of the web page to ingest")
     p_url.add_argument("--autonomous", action="store_true",
                         help="Skip interactive confirmations")
+    p_url.add_argument("--force", action="store_true",
+                        help="Delete existing and re-ingest")
     p_url.set_defaults(func=cmd_ingest_url)
 
     # ingest-feed
@@ -402,6 +445,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_feed.add_argument("feed_url", help="URL of the RSS/Atom feed")
     p_feed.add_argument("--max-articles", type=int, default=None,
                          help="Max articles to ingest (default: config value)")
+    p_feed.add_argument("--force", action="store_true",
+                         help="Delete existing and re-ingest all articles")
     p_feed.set_defaults(func=cmd_ingest_feed)
 
     # ingest-feeds
@@ -410,6 +455,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_feeds.add_argument("feeds_file", help="Path to feeds JSON file")
     p_feeds.add_argument("--max-articles", type=int, default=None,
                           help="Max articles per feed (default: config value)")
+    p_feeds.add_argument("--force", action="store_true",
+                          help="Delete existing and re-ingest all articles")
     p_feeds.set_defaults(func=cmd_ingest_feeds)
 
     # migrate

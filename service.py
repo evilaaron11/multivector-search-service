@@ -160,9 +160,25 @@ def _check_duplicates(
     return False
 
 
+def _force_delete_by_name(name: str) -> None:
+    """Delete an existing document node (and descendants) matching the given name."""
+    for node in store.get_all_nodes(node_type="document"):
+        if node["name"] == name:
+            store.delete_node(node["id"])
+            return
+
+
+def _force_delete_by_url(url: str) -> None:
+    """Delete an existing document node (and descendants) matching a source URL."""
+    existing = store.find_node_by_source_url(url)
+    if existing:
+        store.delete_node(existing["id"])
+
+
 def ingest_document(
     file_path: str,
     confirm_callback: ConfirmCallback | None = None,
+    force: bool = False,
 ) -> IngestResult:
     """Parse, chunk, embed, and store a document in the DAG.
 
@@ -170,6 +186,7 @@ def ingest_document(
         file_path: Path to the markdown file.
         confirm_callback: If provided, called for ambiguous decisions (interactive mode).
             If None, all decisions are made autonomously.
+        force: If True, delete existing document with same name before re-ingesting.
 
     Returns an IngestResult.
     """
@@ -178,6 +195,10 @@ def ingest_document(
     # Parse and chunk
     chunks = chunker.process_markdown(file_path)
     filename = Path(file_path).name
+
+    # Force: delete existing document with same name
+    if force:
+        _force_delete_by_name(filename)
 
     # Collect chunk texts
     chunk_texts = [c["text"] for c in chunks]
@@ -189,8 +210,8 @@ def ingest_document(
     # Embed the summary as a single vector
     summary_vector = embedder.embed_single_vector([doc_summary])[0]
 
-    # Check for duplicates
-    if _check_duplicates(doc_summary, summary_vector):
+    # Check for duplicates (skip if force)
+    if not force and _check_duplicates(doc_summary, summary_vector):
         # Return early — duplicate found
         return IngestResult(
             node_id=-1,
@@ -260,6 +281,7 @@ def ingest_document(
 def ingest_ticker(
     ticker: str,
     confirm_callback: ConfirmCallback | None = None,
+    force: bool = False,
 ) -> IngestResult:
     """Fetch SEC filing, chunk, embed, and store in the DAG."""
     store.init_db()
@@ -267,13 +289,16 @@ def ingest_ticker(
     chunks, metadata = edgar_fetcher.process_ticker(ticker)
     filename = f"{metadata['ticker']}_10K_{metadata['filing_date']}"
 
+    if force:
+        _force_delete_by_name(filename)
+
     chunk_texts = [c["text"] for c in chunks]
     full_text = "\n\n".join(chunk_texts[:5])
 
     doc_summary = generate_leaf_description(full_text)
     summary_vector = embedder.embed_single_vector([doc_summary])[0]
 
-    if _check_duplicates(doc_summary, summary_vector):
+    if not force and _check_duplicates(doc_summary, summary_vector):
         return IngestResult(
             node_id=-1, name=filename, num_chunks=0, sections=[],
         )
@@ -335,6 +360,7 @@ def ingest_url(
     url: str,
     source_name: str | None = None,
     confirm_callback: ConfirmCallback | None = None,
+    force: bool = False,
 ) -> IngestResult:
     """Fetch a web page, extract content, embed, and store in the DAG."""
     store.init_db()
@@ -342,9 +368,12 @@ def ingest_url(
     # Fast URL-based dedup
     existing = store.find_node_by_source_url(url)
     if existing:
-        return IngestResult(
-            node_id=-1, name=existing["name"], num_chunks=0, sections=[],
-        )
+        if force:
+            _force_delete_by_url(url)
+        else:
+            return IngestResult(
+                node_id=-1, name=existing["name"], num_chunks=0, sections=[],
+            )
 
     chunks, metadata = web_fetcher.process_url(url, source_name=source_name)
     title = metadata.get("title", "Untitled")
@@ -357,7 +386,7 @@ def ingest_url(
     description = f"Source: {url}\n\n{doc_summary}"
     summary_vector = embedder.embed_single_vector([doc_summary])[0]
 
-    if _check_duplicates(doc_summary, summary_vector):
+    if not force and _check_duplicates(doc_summary, summary_vector):
         return IngestResult(node_id=-1, name=name, num_chunks=0, sections=[])
 
     parent_id = _find_best_parent(doc_summary, summary_vector, confirm_callback)
@@ -414,6 +443,7 @@ def ingest_feed(
     feed_name: str | None = None,
     max_articles: int | None = None,
     confirm_callback: ConfirmCallback | None = None,
+    force: bool = False,
 ) -> list[IngestResult]:
     """Fetch all articles from an RSS feed and ingest them."""
     store.init_db()
@@ -430,11 +460,15 @@ def ingest_feed(
         # URL dedup
         existing = store.find_node_by_source_url(url)
         if existing:
-            print(f"    Skipped (already ingested)")
-            results.append(IngestResult(
-                node_id=-1, name=existing["name"], num_chunks=0, sections=[],
-            ))
-            continue
+            if force:
+                _force_delete_by_url(url)
+                print(f"    Replacing existing version")
+            else:
+                print(f"    Skipped (already ingested)")
+                results.append(IngestResult(
+                    node_id=-1, name=existing["name"], num_chunks=0, sections=[],
+                ))
+                continue
 
         name = f"{source}: {title}" if source else title
         chunk_texts = [c["text"] for c in chunks]
@@ -445,7 +479,7 @@ def ingest_feed(
             description = f"Source: {url}\n\n{doc_summary}"
             summary_vector = embedder.embed_single_vector([doc_summary])[0]
 
-            if _check_duplicates(doc_summary, summary_vector):
+            if not force and _check_duplicates(doc_summary, summary_vector):
                 print(f"    Skipped (duplicate content)")
                 results.append(IngestResult(node_id=-1, name=name, num_chunks=0, sections=[]))
                 continue
@@ -508,6 +542,7 @@ def ingest_all_feeds(
     feeds_file: str,
     max_articles: int | None = None,
     confirm_callback: ConfirmCallback | None = None,
+    force: bool = False,
 ) -> list[IngestResult]:
     """Load a feeds JSON file and ingest all feeds."""
     feeds = web_fetcher.load_feeds_file(feeds_file)
@@ -522,6 +557,7 @@ def ingest_all_feeds(
             feed_name=feed_name,
             max_articles=max_articles,
             confirm_callback=confirm_callback,
+            force=force,
         )
         all_results.extend(results)
 
