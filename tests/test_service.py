@@ -1,7 +1,7 @@
 """Unit tests for the service orchestration layer.
 
-All underlying modules (store, chunker, embedder, searcher) are mocked
-so no real DB, API, or filesystem access occurs.
+All underlying modules (store, chunker, embedder, searcher, llm) are mocked
+so no real DB, API, filesystem, or CLI access occurs.
 """
 
 import sys
@@ -9,6 +9,7 @@ import sys
 sys.path.insert(0, "C:/Users/aaron/Documents/embedded")
 
 from unittest.mock import patch, MagicMock, call
+
 import numpy as np
 import pytest
 
@@ -16,341 +17,319 @@ import service
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Shared test data
 # ---------------------------------------------------------------------------
 
 FAKE_CHUNKS = [
-    {
-        "section": "Item 1",
-        "text": "First chunk text.",
-        "chunk_index": 0,
-        "token_count": 3,
-    },
-    {
-        "section": "Item 1",
-        "text": "Second chunk text.",
-        "chunk_index": 1,
-        "token_count": 3,
-    },
-    {
-        "section": "Item 7",
-        "text": "Third chunk text.",
-        "chunk_index": 0,
-        "token_count": 3,
-    },
+    {"section": "Intro", "text": "Hello world", "chunk_index": 0, "token_count": 10},
+    {"section": "Body", "text": "More content", "chunk_index": 0, "token_count": 12},
 ]
 
-FAKE_EMBEDDINGS = [
-    np.zeros((5, 128), dtype=np.float32),
-    np.ones((5, 128), dtype=np.float32),
-    np.full((5, 128), 2.0, dtype=np.float32),
+FAKE_EMBEDDINGS_MULTI = [
+    np.random.randn(10, 128).astype(np.float32),
+    np.random.randn(12, 128).astype(np.float32),
 ]
+
+FAKE_SUMMARY_VECTOR = np.random.randn(1024).astype(np.float32)
 
 FAKE_SEARCH_RESULTS = [
     {
-        "chunk_id": 10,
-        "score": 0.95,
-        "text": "Matching chunk text.",
-        "section": "Item 7",
-        "document_id": 1,
-        "chunk_index": 0,
-        "token_count": 3,
-    },
-    {
-        "chunk_id": 11,
-        "score": 0.80,
-        "text": "Another matching chunk.",
-        "section": "Item 1",
-        "document_id": 1,
-        "chunk_index": 1,
-        "token_count": 3,
-    },
-]
-
-FAKE_DOC_ROWS = [
-    {
-        "id": 1,
-        "filename": "report.md",
-        "ingested_at": "2026-01-15T10:30:00",
-        "chunk_count": 12,
-    },
-    {
-        "id": 2,
-        "filename": "filing.md",
-        "ingested_at": "2026-02-20T14:00:00",
-        "chunk_count": 8,
+        "node_id": 1,
+        "score": 5.2,
+        "text": "result text",
+        "name": "chunk 0",
+        "node_type": "chunk",
+        "highlights": [("result", 0.85, "query")],
     },
 ]
 
 
 # ---------------------------------------------------------------------------
-# ingest_document tests
+# Ingestion tests
 # ---------------------------------------------------------------------------
 
-@patch("service.embedder")
-@patch("service.store")
-@patch("service.chunker")
-def test_ingest_calls_in_correct_order(mock_chunker, mock_store, mock_embedder):
-    """Verify that ingest calls chunker, store inserts, embedder, and
-    save_vectors in the expected sequence."""
-    mock_chunker.process_markdown.return_value = FAKE_CHUNKS
-    mock_store.insert_document.return_value = 42
-    mock_store.insert_chunk.side_effect = [100, 101, 102]
-    mock_embedder.embed_documents.return_value = FAKE_EMBEDDINGS
+class TestIngestDocument:
 
-    service.ingest_document("/tmp/test.md")
+    @patch("service.update_ancestor_summaries")
+    @patch("service.embedder")
+    @patch("service.store")
+    @patch("service.chunker")
+    @patch("service.generate_leaf_description", return_value="A document about testing")
+    @patch("service.confirm_duplicate", return_value={"is_duplicate": False})
+    @patch("service.propose_placement", return_value={
+        "action": "create_new_branch",
+        "target_node_id": None,
+        "new_branch_name": "Uncategorized",
+        "new_branch_description": "",
+        "confidence": 0.5,
+        "reasoning": "No existing nodes",
+    })
+    def test_ingest_creates_document_and_chunks(
+        self, mock_placement, mock_dedup, mock_desc, mock_chunker, mock_store, mock_embedder, mock_update
+    ):
+        mock_chunker.process_markdown.return_value = FAKE_CHUNKS
+        mock_store.init_db.return_value = None
+        mock_store.get_all_nodes.return_value = []
+        mock_store.insert_node.side_effect = [100, 101, 102]  # doc, chunk1, chunk2
+        mock_store.save_vectors.return_value = None
+        mock_store.insert_edge.return_value = None
+        mock_store.get_node.return_value = None
+        mock_embedder.embed_single_vector.return_value = [FAKE_SUMMARY_VECTOR]
+        mock_embedder.embed_documents.return_value = FAKE_EMBEDDINGS_MULTI
 
-    # 1. init_db
-    mock_store.init_db.assert_called_once()
+        result = service.ingest_document("test.md")
 
-    # 2. chunker processes the file
-    mock_chunker.process_markdown.assert_called_once_with("/tmp/test.md")
+        assert result.node_id == 100
+        assert result.name == "test.md"
+        assert result.num_chunks == 2
+        assert "Intro" in result.sections
+        assert "Body" in result.sections
 
-    # 3. document inserted
-    mock_store.insert_document.assert_called_once_with("test.md")
+    @patch("service.update_ancestor_summaries")
+    @patch("service.embedder")
+    @patch("service.store")
+    @patch("service.chunker")
+    @patch("service.generate_leaf_description", return_value="A document")
+    @patch("service.confirm_duplicate", return_value={"is_duplicate": True})
+    def test_ingest_skips_duplicate(
+        self, mock_dedup, mock_desc, mock_chunker, mock_store, mock_embedder, mock_update
+    ):
+        mock_chunker.process_markdown.return_value = FAKE_CHUNKS
+        mock_store.init_db.return_value = None
+        mock_store.get_all_nodes.return_value = [
+            {"id": 1, "node_type": "document", "embedding_type": "single", "name": "existing", "description": "existing"}
+        ]
+        mock_store.load_vectors.return_value = FAKE_SUMMARY_VECTOR
+        mock_embedder.embed_single_vector.return_value = [FAKE_SUMMARY_VECTOR]
 
-    # 4. each chunk inserted
-    assert mock_store.insert_chunk.call_count == 3
-    mock_store.insert_chunk.assert_any_call(
-        document_id=42,
-        text="First chunk text.",
-        section="Item 1",
-        chunk_index=0,
-        token_count=3,
-    )
+        result = service.ingest_document("duplicate.md")
 
-    # 5. embedder called with all chunk texts
-    mock_embedder.embed_documents.assert_called_once_with(
-        ["First chunk text.", "Second chunk text.", "Third chunk text."]
-    )
+        assert result.node_id == -1
+        assert result.num_chunks == 0
 
-    # 6. save_vectors called for each chunk
-    assert mock_store.save_vectors.call_count == 3
-    mock_store.save_vectors.assert_any_call(100, FAKE_EMBEDDINGS[0])
-    mock_store.save_vectors.assert_any_call(101, FAKE_EMBEDDINGS[1])
-    mock_store.save_vectors.assert_any_call(102, FAKE_EMBEDDINGS[2])
+    @patch("service.update_ancestor_summaries")
+    @patch("service.embedder")
+    @patch("service.store")
+    @patch("service.chunker")
+    @patch("service.generate_leaf_description", return_value="doc summary")
+    @patch("service.confirm_duplicate", return_value={"is_duplicate": False})
+    @patch("service.propose_placement", return_value={
+        "action": "attach_to_existing",
+        "target_node_id": 50,
+        "confidence": 0.9,
+        "reasoning": "Matches Finance",
+    })
+    def test_ingest_attaches_to_existing_parent(
+        self, mock_placement, mock_dedup, mock_desc, mock_chunker, mock_store, mock_embedder, mock_update
+    ):
+        mock_chunker.process_markdown.return_value = FAKE_CHUNKS
+        mock_store.init_db.return_value = None
+        mock_store.get_all_nodes.return_value = [
+            {"id": 50, "name": "Finance", "node_type": "category",
+             "embedding_type": "single", "description": "Financial news"}
+        ]
+        mock_store.load_vectors.return_value = FAKE_SUMMARY_VECTOR
+        mock_store.insert_node.side_effect = [200, 201, 202]
+        mock_store.save_vectors.return_value = None
+        mock_store.insert_edge.return_value = None
+        mock_store.get_node.return_value = {"node_type": "category", "name": "Finance"}
+        mock_embedder.embed_single_vector.return_value = [FAKE_SUMMARY_VECTOR]
+        mock_embedder.embed_documents.return_value = FAKE_EMBEDDINGS_MULTI
 
+        result = service.ingest_document("finance_article.md")
 
-@patch("service.embedder")
-@patch("service.store")
-@patch("service.chunker")
-def test_ingest_returns_correct_result(mock_chunker, mock_store, mock_embedder):
-    """Verify IngestResult fields are populated correctly."""
-    mock_chunker.process_markdown.return_value = FAKE_CHUNKS
-    mock_store.insert_document.return_value = 7
-    mock_store.insert_chunk.side_effect = [10, 11, 12]
-    mock_embedder.embed_documents.return_value = FAKE_EMBEDDINGS
+        assert result.parent_node_id == 50
+        mock_store.insert_edge.assert_any_call(50, 200)
 
-    result = service.ingest_document("/data/report.md")
+    @patch("service.update_ancestor_summaries")
+    @patch("service.embedder")
+    @patch("service.store")
+    @patch("service.chunker")
+    @patch("service.generate_leaf_description", return_value="doc summary")
+    @patch("service.confirm_duplicate", return_value={"is_duplicate": False})
+    @patch("service.propose_placement", return_value={
+        "action": "attach_to_existing",
+        "target_node_id": 50,
+        "confidence": 0.5,
+        "reasoning": "Uncertain match",
+    })
+    def test_interactive_mode_calls_callback(
+        self, mock_placement, mock_dedup, mock_desc, mock_chunker, mock_store, mock_embedder, mock_update
+    ):
+        mock_chunker.process_markdown.return_value = FAKE_CHUNKS
+        mock_store.init_db.return_value = None
+        mock_store.get_all_nodes.return_value = [
+            {"id": 50, "name": "Finance", "node_type": "category",
+             "embedding_type": "single", "description": "Financial news"}
+        ]
+        mock_store.load_vectors.return_value = FAKE_SUMMARY_VECTOR
+        mock_store.insert_node.side_effect = [200, 201, 202]
+        mock_store.save_vectors.return_value = None
+        mock_store.insert_edge.return_value = None
+        mock_store.get_node.return_value = {"node_type": "category", "name": "Finance"}
+        mock_embedder.embed_single_vector.return_value = [FAKE_SUMMARY_VECTOR]
+        mock_embedder.embed_documents.return_value = FAKE_EMBEDDINGS_MULTI
 
-    assert isinstance(result, service.IngestResult)
-    assert result.document_id == 7
-    assert result.filename == "report.md"
-    assert result.num_chunks == 3
-    assert result.sections == ["Item 1", "Item 7"]
+        callback = MagicMock(return_value=0)  # pick first option
+        result = service.ingest_document("uncertain.md", confirm_callback=callback)
 
-
-# ---------------------------------------------------------------------------
-# search_documents tests
-# ---------------------------------------------------------------------------
-
-@patch("service.searcher")
-@patch("service.store")
-def test_search_calls_searcher(mock_store, mock_searcher):
-    """Verify search_documents delegates to searcher.search and returns
-    SearchResult objects."""
-    mock_searcher.search.return_value = FAKE_SEARCH_RESULTS
-
-    results = service.search_documents("revenue growth", top_k=2)
-
-    mock_store.init_db.assert_called_once()
-    mock_searcher.search.assert_called_once_with(
-        query="revenue growth",
-        top_k=2,
-        document_id=None,
-        section=None,
-    )
-
-    assert len(results) == 2
-    assert all(isinstance(r, service.SearchResult) for r in results)
-    assert results[0].chunk_id == 10
-    assert results[0].score == 0.95
-    assert results[1].text == "Another matching chunk."
-
-
-@patch("service.searcher")
-@patch("service.store")
-def test_search_passes_filters(mock_store, mock_searcher):
-    """Verify document_id and section filters are forwarded to searcher."""
-    mock_searcher.search.return_value = []
-
-    service.search_documents(
-        "risk factors",
-        top_k=3,
-        document_id=5,
-        section="Item 1A",
-    )
-
-    mock_searcher.search.assert_called_once_with(
-        query="risk factors",
-        top_k=3,
-        document_id=5,
-        section="Item 1A",
-    )
-
-
-# ---------------------------------------------------------------------------
-# list_documents tests
-# ---------------------------------------------------------------------------
-
-@patch("service.store")
-def test_list_documents_returns_document_info(mock_store):
-    """Verify list_documents returns DocumentInfo objects."""
-    mock_store.list_documents.return_value = FAKE_DOC_ROWS
-
-    results = service.list_documents()
-
-    mock_store.init_db.assert_called_once()
-    assert len(results) == 2
-    assert all(isinstance(d, service.DocumentInfo) for d in results)
-    assert results[0].document_id == 1
-    assert results[0].filename == "report.md"
-    assert results[0].chunk_count == 12
-    assert results[1].ingested_at == "2026-02-20T14:00:00"
+        callback.assert_called_once()
+        assert result.node_id == 200
 
 
 # ---------------------------------------------------------------------------
-# delete_document tests
+# Search tests
 # ---------------------------------------------------------------------------
 
-@patch("service.store")
-def test_delete_document_exists(mock_store):
-    """Verify delete returns True when the document exists."""
-    mock_store.get_document.return_value = {"id": 1, "filename": "f.md"}
+class TestSearchDocuments:
 
-    result = service.delete_document(1)
+    @patch("service.searcher")
+    @patch("service.store")
+    def test_flat_search(self, mock_store, mock_searcher):
+        mock_store.init_db.return_value = None
+        mock_searcher.flat_search.return_value = FAKE_SEARCH_RESULTS
 
-    mock_store.init_db.assert_called_once()
-    mock_store.get_document.assert_called_once_with(1)
-    mock_store.delete_document.assert_called_once_with(1)
-    assert result is True
+        results = service.search_documents("test query", flat=True)
 
+        mock_searcher.flat_search.assert_called_once_with("test query", top_k=5, node_id=None)
+        assert len(results) == 1
+        assert isinstance(results[0], service.SearchResult)
+        assert results[0].score == 5.2
 
-@patch("service.store")
-def test_delete_document_not_found(mock_store):
-    """Verify delete returns False when the document does not exist."""
-    mock_store.get_document.return_value = None
+    @patch("service.searcher")
+    @patch("service.store")
+    def test_graph_search(self, mock_store, mock_searcher):
+        mock_store.init_db.return_value = None
+        mock_searcher.graph_search.return_value = FAKE_SEARCH_RESULTS
 
-    result = service.delete_document(999)
+        results = service.search_documents("test query", flat=False)
 
-    mock_store.init_db.assert_called_once()
-    mock_store.get_document.assert_called_once_with(999)
-    mock_store.delete_document.assert_not_called()
-    assert result is False
+        mock_searcher.graph_search.assert_called_once_with("test query", top_k=5)
+        assert len(results) == 1
+
+    @patch("service.searcher")
+    @patch("service.store")
+    def test_respects_top_k(self, mock_store, mock_searcher):
+        mock_store.init_db.return_value = None
+        mock_searcher.graph_search.return_value = []
+
+        service.search_documents("query", top_k=10)
+
+        mock_searcher.graph_search.assert_called_once_with("query", top_k=10)
 
 
 # ---------------------------------------------------------------------------
-# ingest_ticker tests
+# List and delete tests
 # ---------------------------------------------------------------------------
 
-FAKE_TICKER_METADATA = {
-    "ticker": "INTC",
-    "company_name": "Intel Corporation",
-    "filing_date": "2024-02-21",
-    "form_type": "10-K",
-}
+class TestListNodes:
+
+    @patch("service.store")
+    def test_returns_node_info(self, mock_store):
+        mock_store.init_db.return_value = None
+        mock_store.get_all_nodes.return_value = [
+            {"id": 1, "name": "News", "node_type": "category",
+             "description": "News articles", "embedding_type": "single"},
+            {"id": 2, "name": "Chunk 0", "node_type": "chunk",
+             "description": "", "embedding_type": "multi"},
+        ]
+        mock_store.count_children.side_effect = [3, 0]
+
+        results = service.list_nodes()
+
+        assert len(results) == 2
+        assert isinstance(results[0], service.NodeInfo)
+        assert results[0].name == "News"
+        assert results[0].child_count == 3
+        assert results[1].child_count == 0
 
 
-@patch("service.embedder")
-@patch("service.store")
-@patch("service.edgar_fetcher")
-def test_ingest_ticker_calls_process_ticker(mock_edgar, mock_store, mock_embedder):
-    """Verify ingest_ticker calls edgar_fetcher.process_ticker with the ticker."""
-    mock_edgar.process_ticker.return_value = (FAKE_CHUNKS, FAKE_TICKER_METADATA)
-    mock_store.insert_document.return_value = 1
-    mock_store.insert_chunk.side_effect = [100, 101, 102]
-    mock_embedder.embed_documents.return_value = FAKE_EMBEDDINGS
+class TestDeleteNode:
 
-    service.ingest_ticker("INTC")
+    @patch("service.store")
+    def test_delete_existing(self, mock_store):
+        mock_store.init_db.return_value = None
+        mock_store.get_node.return_value = {"id": 1, "name": "test"}
+        mock_store.delete_node.return_value = None
 
-    mock_edgar.process_ticker.assert_called_once_with("INTC")
+        assert service.delete_node(1) is True
+        mock_store.delete_node.assert_called_once_with(1)
 
+    @patch("service.store")
+    def test_delete_nonexistent(self, mock_store):
+        mock_store.init_db.return_value = None
+        mock_store.get_node.return_value = None
 
-@patch("service.embedder")
-@patch("service.store")
-@patch("service.edgar_fetcher")
-def test_ingest_ticker_creates_correct_filename(mock_edgar, mock_store, mock_embedder):
-    """Verify the generated filename uses ticker, form type, and filing date."""
-    mock_edgar.process_ticker.return_value = (FAKE_CHUNKS, FAKE_TICKER_METADATA)
-    mock_store.insert_document.return_value = 1
-    mock_store.insert_chunk.side_effect = [100, 101, 102]
-    mock_embedder.embed_documents.return_value = FAKE_EMBEDDINGS
-
-    result = service.ingest_ticker("INTC")
-
-    assert result.filename == "INTC_10K_2024-02-21"
-    mock_store.insert_document.assert_called_once_with("INTC_10K_2024-02-21")
+        assert service.delete_node(999) is False
 
 
-@patch("service.embedder")
-@patch("service.store")
-@patch("service.edgar_fetcher")
-def test_ingest_ticker_returns_correct_result(mock_edgar, mock_store, mock_embedder):
-    """Verify IngestResult fields are populated correctly for ticker ingest."""
-    mock_edgar.process_ticker.return_value = (FAKE_CHUNKS, FAKE_TICKER_METADATA)
-    mock_store.insert_document.return_value = 55
-    mock_store.insert_chunk.side_effect = [200, 201, 202]
-    mock_embedder.embed_documents.return_value = FAKE_EMBEDDINGS
+# ---------------------------------------------------------------------------
+# Enrichment tests
+# ---------------------------------------------------------------------------
 
-    result = service.ingest_ticker("INTC")
+class TestEnrichGraph:
 
-    assert isinstance(result, service.IngestResult)
-    assert result.document_id == 55
-    assert result.filename == "INTC_10K_2024-02-21"
-    assert result.num_chunks == 3
-    assert result.sections == ["Item 1", "Item 7"]
+    @patch("service.embedder")
+    @patch("service.store")
+    @patch("service.generate_node_summary", return_value="Branch summary")
+    @patch("service.generate_leaf_description", return_value="Leaf description")
+    def test_enriches_leaves_and_branches(
+        self, mock_leaf_desc, mock_branch_desc, mock_store, mock_embedder
+    ):
+        leaf = {"id": 1, "name": "Chunk", "node_type": "chunk",
+                "text": "content", "description": "", "embedding_type": "multi"}
+        branch = {"id": 2, "name": "Doc", "node_type": "document",
+                  "text": "", "description": "", "embedding_type": None}
 
+        mock_store.init_db.return_value = None
+        mock_store.get_all_nodes.return_value = [leaf, branch]
+        mock_store.get_children.side_effect = lambda nid: [leaf] if nid == 2 else []
+        mock_store.get_ancestors.return_value = []
+        mock_store.update_node.return_value = None
+        mock_store.save_vectors.return_value = None
+        mock_embedder.embed_single_vector.return_value = [FAKE_SUMMARY_VECTOR]
 
-@patch("service.embedder")
-@patch("service.store")
-@patch("service.edgar_fetcher")
-def test_ingest_ticker_calls_in_correct_order(mock_edgar, mock_store, mock_embedder):
-    """Verify that ingest_ticker calls store/embedder in the correct sequence."""
-    mock_edgar.process_ticker.return_value = (FAKE_CHUNKS, FAKE_TICKER_METADATA)
-    mock_store.insert_document.return_value = 42
-    mock_store.insert_chunk.side_effect = [100, 101, 102]
-    mock_embedder.embed_documents.return_value = FAKE_EMBEDDINGS
+        count = service.enrich_graph()
 
-    service.ingest_ticker("INTC")
+        assert count == 2
+        mock_leaf_desc.assert_called_once()
+        mock_branch_desc.assert_called_once()
 
-    # 1. init_db
-    mock_store.init_db.assert_called_once()
+    @patch("service.store")
+    def test_skips_nodes_with_descriptions(self, mock_store):
+        leaf = {"id": 1, "name": "C", "node_type": "chunk",
+                "text": "content", "description": "already described", "embedding_type": "multi"}
 
-    # 2. edgar_fetcher processes the ticker
-    mock_edgar.process_ticker.assert_called_once_with("INTC")
+        mock_store.init_db.return_value = None
+        mock_store.get_all_nodes.return_value = [leaf]
+        mock_store.get_children.return_value = []
 
-    # 3. document inserted with generated filename
-    mock_store.insert_document.assert_called_once_with("INTC_10K_2024-02-21")
-
-    # 4. each chunk inserted
-    assert mock_store.insert_chunk.call_count == 3
-    mock_store.insert_chunk.assert_any_call(
-        document_id=42,
-        text="First chunk text.",
-        section="Item 1",
-        chunk_index=0,
-        token_count=3,
-    )
-
-    # 5. embedder called with all chunk texts
-    mock_embedder.embed_documents.assert_called_once_with(
-        ["First chunk text.", "Second chunk text.", "Third chunk text."]
-    )
-
-    # 6. save_vectors called for each chunk
-    assert mock_store.save_vectors.call_count == 3
-    mock_store.save_vectors.assert_any_call(100, FAKE_EMBEDDINGS[0])
-    mock_store.save_vectors.assert_any_call(101, FAKE_EMBEDDINGS[1])
-    mock_store.save_vectors.assert_any_call(102, FAKE_EMBEDDINGS[2])
+        count = service.enrich_graph()
+        assert count == 0
 
 
+# ---------------------------------------------------------------------------
+# Summary propagation tests
+# ---------------------------------------------------------------------------
+
+class TestUpdateAncestorSummaries:
+
+    @patch("service.embedder")
+    @patch("service.store")
+    @patch("service.generate_node_summary", return_value="Updated summary")
+    def test_updates_ancestors(self, mock_summary, mock_store, mock_embedder):
+        mock_store.get_ancestors.return_value = [
+            {"id": 10, "name": "Parent", "node_type": "category"}
+        ]
+        mock_store.get_children.return_value = [
+            {"id": 20, "name": "Child", "description": "child desc"}
+        ]
+        mock_store.update_node.return_value = None
+        mock_store.save_vectors.return_value = None
+        mock_embedder.embed_single_vector.return_value = [FAKE_SUMMARY_VECTOR]
+
+        service.update_ancestor_summaries(20)
+
+        mock_summary.assert_called_once()
+        mock_store.update_node.assert_any_call(10, description="Updated summary")
+        mock_store.save_vectors.assert_called()

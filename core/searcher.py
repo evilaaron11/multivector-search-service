@@ -1,14 +1,20 @@
-"""MaxSim search over ColBERT multi-vector embeddings."""
+"""Search: MaxSim for multi-vector, cosine for single-vector, graph traversal."""
 
 import numpy as np
 from tokenizers import Tokenizer
 
-from core.store import get_all_chunk_ids, load_vectors, get_chunk
-from core.embedder import embed_query
-from config import DEFAULT_TOP_K
+from core.store import get_node, get_leaf_nodes, get_roots, get_children, load_vectors
+from core.embedder import embed_query, embed_single_query
+from core.graph import get_graph_description
+from config import (
+    DEFAULT_TOP_K,
+    SEARCH_SCORE_THRESHOLD_HIGH,
+    SEARCH_SCORE_THRESHOLD_LOW,
+    SEARCH_MAX_CANDIDATES_PER_LEVEL,
+    SEARCH_LLM_AMBIGUITY_RANGE,
+)
 
 # Load the XLM-RoBERTa tokenizer once (jina-colbert-v2's backbone).
-# This is just a vocabulary lookup table — no GPU, ~2MB memory.
 _tokenizer: Tokenizer | None = None
 
 
@@ -24,18 +30,15 @@ def _normalize(vectors: np.ndarray) -> np.ndarray:
     return vectors / (np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-10)
 
 
+# ---------------------------------------------------------------------------
+# Scoring functions
+# ---------------------------------------------------------------------------
+
 def maxsim_score(query_vectors: np.ndarray, doc_vectors: np.ndarray) -> float:
-    """Compute the MaxSim score between query and document token embeddings.
+    """MaxSim score between query and document token embeddings.
 
-    For each query token vector, find the maximum cosine similarity against all
-    document token vectors, then sum those maxima.
-
-    Args:
-        query_vectors: Array of shape (Q, 128) — one row per query token.
-        doc_vectors:   Array of shape (D, 128) — one row per document token.
-
-    Returns:
-        Scalar MaxSim score (sum of per-query-token max cosine similarities).
+    For each query token, find max cosine similarity against all document tokens,
+    then sum those maxima.
     """
     q_norm = _normalize(query_vectors)
     d_norm = _normalize(doc_vectors)
@@ -43,21 +46,35 @@ def maxsim_score(query_vectors: np.ndarray, doc_vectors: np.ndarray) -> float:
     return float(np.sum(np.max(sim, axis=1)))
 
 
+def cosine_score(query_vector: np.ndarray, node_vector: np.ndarray) -> float:
+    """Cosine similarity between two 1-D vectors. Used for single-vector nodes."""
+    q = query_vector / (np.linalg.norm(query_vector) + 1e-10)
+    d = node_vector / (np.linalg.norm(node_vector) + 1e-10)
+    return float(q @ d)
+
+
+def score_node(
+    query_single: np.ndarray,
+    query_multi: np.ndarray,
+    node_id: int,
+    embedding_type: str,
+) -> float:
+    """Score a node against query vectors, dispatching based on embedding type."""
+    vectors = load_vectors(node_id)
+    if embedding_type == "single":
+        return cosine_score(query_single, vectors)
+    else:  # "multi"
+        return maxsim_score(query_multi, vectors)
+
+
+# ---------------------------------------------------------------------------
+# Token-level relevance (unchanged from original)
+# ---------------------------------------------------------------------------
+
 def token_relevance(
     query_vectors: np.ndarray, doc_vectors: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-document-token relevance to the query.
-
-    For each document token, returns its max cosine similarity to any query
-    token and the index of the best-matching query token.
-
-    Args:
-        query_vectors: Array of shape (Q, 128).
-        doc_vectors:   Array of shape (D, 128).
-
-    Returns:
-        Tuple of (scores, matched_query_indices) — both shape (D,).
-    """
+    """Per-document-token relevance: max cosine sim to any query token."""
     q_norm = _normalize(query_vectors)
     d_norm = _normalize(doc_vectors)
     sim = q_norm @ d_norm.T  # (Q, D)
@@ -65,26 +82,15 @@ def token_relevance(
 
 
 def _query_token_to_word(query: str, query_vectors: np.ndarray) -> list[str]:
-    """Map each query API token index to the query word it belongs to.
-
-    ColBERT query layout: [Q_marker] [<s>] [real tokens...] [</s>] [padding...]
-    padded to a fixed length (typically 32).  The marker is an extra token not
-    produced by the local tokenizer, so API index ``i`` corresponds to local
-    tokenizer index ``i - 1``.  Indices beyond the tokenizer length are padding.
-
-    Returns a list of length equal to ``len(query_vectors)`` where each element
-    is the whitespace-split query word that token came from.  Special / padding
-    tokens map to ``""``.
-    """
+    """Map each query API token index to the query word it belongs to."""
     tokenizer = _get_tokenizer()
     q_words = query.split()
     if not q_words:
         return [""] * len(query_vectors)
 
     encoding = tokenizer.encode(query)
-    offsets = encoding.offsets  # includes <s> and </s>
+    offsets = encoding.offsets
 
-    # Build char→word map for the query
     word_starts: list[int] = []
     pos = 0
     for w in q_words:
@@ -101,14 +107,7 @@ def _query_token_to_word(query: str, query_vectors: np.ndarray) -> list[str]:
                 break
         return best
 
-    # API index 0 = [Q] marker (not in local tokenizer)
-    # API index 1 = local index 0 (<s>, offset (0,0) → skip)
-    # API index 2 = local index 1 (first real subword token)
-    # ...
-    # API index len(offsets) = local index len(offsets)-1 (</s>)
-    # API index > len(offsets) = padding → ""
-    marker_offset = 1  # the [Q] prefix token
-
+    marker_offset = 1
     mapping: list[str] = []
     for t_idx in range(len(query_vectors)):
         tok_idx = t_idx - marker_offset
@@ -130,17 +129,7 @@ def word_relevance(
     query_vectors: np.ndarray,
     doc_vectors: np.ndarray,
 ) -> list[tuple[str, float, str]]:
-    """Map token-level relevance scores to words using the XLM-RoBERTa tokenizer.
-
-    Uses the tokenizer's character offsets to map subword token scores back to
-    exact word spans in the original text. Multiple subword tokens belonging to
-    the same word are max-pooled; the matched query word comes from the
-    best-scoring token.
-
-    Returns:
-        List of (word, score, matched_query_word) tuples matching
-        whitespace-split words. matched_query_word is "" for low-relevance words.
-    """
+    """Map token-level relevance scores to words using XLM-RoBERTa tokenizer."""
     words = text.split()
     if not words:
         return []
@@ -148,13 +137,10 @@ def word_relevance(
     tok_scores, tok_query_indices = token_relevance(query_vectors, doc_vectors)
     query_token_words = _query_token_to_word(query, query_vectors)
 
-    # Tokenize to get character-level offsets
     tokenizer = _get_tokenizer()
     encoding = tokenizer.encode(text)
-    offsets = encoding.offsets  # list of (start_char, end_char) per token
+    offsets = encoding.offsets
 
-    # Build a map from character position to word index
-    # We find the start char of each whitespace-split word
     word_starts: list[int] = []
     pos = 0
     for w in words:
@@ -163,7 +149,6 @@ def word_relevance(
         pos = idx + len(w)
 
     def char_to_word_idx(char_pos: int) -> int:
-        """Find which word a character position belongs to."""
         best = 0
         for i, ws in enumerate(word_starts):
             if ws <= char_pos:
@@ -172,29 +157,20 @@ def word_relevance(
                 break
         return best
 
-    # Map each token's score to its word, max-pooling
     word_scores = np.zeros(len(words))
     word_matched_query: list[str] = [""] * len(words)
 
-    # The API returns vectors including <s> and </s> special tokens.
-    # The tokenizer also produces them. We align by index directly.
-    # Skip special tokens (offset == (0,0)) when mapping.
     num_api_tokens = len(tok_scores)
     num_tokenizer_tokens = len(offsets)
-
-    # If API has one extra token (e.g. query prefix), offset by 1
     offset_shift = max(0, num_api_tokens - num_tokenizer_tokens)
 
     for t_idx in range(num_api_tokens):
         tok_idx = t_idx - offset_shift
         if tok_idx < 0 or tok_idx >= num_tokenizer_tokens:
             continue
-
         start, end = offsets[tok_idx]
         if start == 0 and end == 0:
-            # Special token (<s>, </s>) — skip
             continue
-
         w_idx = char_to_word_idx(start)
         score = tok_scores[t_idx]
         if score > word_scores[w_idx]:
@@ -205,56 +181,214 @@ def word_relevance(
     return list(zip(words, word_scores.tolist(), word_matched_query))
 
 
-def search(
+# ---------------------------------------------------------------------------
+# Flat search (backward-compatible, searches all leaf nodes)
+# ---------------------------------------------------------------------------
+
+def flat_search(
     query: str,
     top_k: int = DEFAULT_TOP_K,
-    document_id: int | None = None,
-    section: str | None = None,
+    node_id: int | None = None,
 ) -> list[dict]:
-    """Run a MaxSim search and return the top-k matching chunks.
+    """Run a MaxSim search over all leaf nodes (or leaves under a specific node).
 
-    Args:
-        query:       Natural-language query string.
-        top_k:       Number of results to return.
-        document_id: If set, restrict search to chunks from this document.
-        section:     If set, restrict search to chunks in this section.
-
-    Returns:
-        List of result dicts sorted by score descending.  Each dict contains:
-        chunk_id, score, text, section, document_id, chunk_index, token_count.
+    This is the original search behavior, preserved for backward compatibility
+    and as a fallback when graph navigation isn't possible.
     """
     query_vectors = embed_query(query)
-    chunk_ids = get_all_chunk_ids(document_id=document_id, section=section)
+    leaves = get_leaf_nodes(parent_id=node_id)
 
-    if not chunk_ids:
+    if not leaves:
         return []
 
-    scored: list[tuple[int, float]] = []
-    for cid in chunk_ids:
-        doc_vectors = load_vectors(cid)
+    scored: list[tuple[dict, float]] = []
+    for leaf in leaves:
+        if leaf.get("embedding_type") != "multi":
+            continue
+        doc_vectors = load_vectors(leaf["id"])
         score = maxsim_score(query_vectors, doc_vectors)
-        scored.append((cid, score))
+        scored.append((leaf, score))
 
-    # Sort descending by score
     scored.sort(key=lambda x: x[1], reverse=True)
     scored = scored[:top_k]
 
     results: list[dict] = []
-    for cid, score in scored:
-        chunk = get_chunk(cid)
-        if chunk is None:
-            continue
-        doc_vectors = load_vectors(cid)
-        highlights = word_relevance(chunk["text"], query, query_vectors, doc_vectors)
+    for leaf, score in scored:
+        doc_vectors = load_vectors(leaf["id"])
+        highlights = word_relevance(leaf["text"], query, query_vectors, doc_vectors)
         results.append({
-            "chunk_id": cid,
+            "node_id": leaf["id"],
             "score": score,
-            "text": chunk["text"],
-            "section": chunk["section"],
-            "document_id": chunk["document_id"],
-            "chunk_index": chunk["chunk_index"],
-            "token_count": chunk["token_count"],
+            "text": leaf["text"],
+            "name": leaf["name"],
+            "node_type": leaf["node_type"],
+            "token_count": leaf["token_count"],
             "highlights": highlights,
         })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Graph search (level-by-level DAG navigation)
+# ---------------------------------------------------------------------------
+
+def _select_candidates(
+    query: str,
+    candidates: list[dict],
+) -> list[dict]:
+    """Apply threshold routing to select which candidates to descend into.
+
+    Uses score thresholds with LLM fallback for ambiguous cases.
+    """
+    if not candidates:
+        return []
+
+    scores = [c["score"] for c in candidates]
+    max_score = max(scores)
+    min_score = min(scores)
+
+    # Filter to candidates above the low threshold
+    viable = [c for c in candidates if c["score"] >= SEARCH_SCORE_THRESHOLD_LOW]
+    if not viable:
+        # Nothing above threshold — take the single best anyway
+        return [candidates[0]]
+
+    # If scores are tightly clustered (ambiguous), use LLM routing
+    if max_score - min_score <= SEARCH_LLM_AMBIGUITY_RANGE and len(viable) > 1:
+        try:
+            from core.llm import llm_route_search
+            selected_ids = llm_route_search(query, viable)
+            selected = [c for c in viable if c["id"] in selected_ids]
+            if selected:
+                return selected[:SEARCH_MAX_CANDIDATES_PER_LEVEL]
+        except Exception:
+            pass  # Fall through to threshold-based selection
+
+    # Take candidates above high threshold, or top N if none are that high
+    high = [c for c in viable if c["score"] >= SEARCH_SCORE_THRESHOLD_HIGH]
+    if high:
+        return high[:SEARCH_MAX_CANDIDATES_PER_LEVEL]
+
+    return viable[:SEARCH_MAX_CANDIDATES_PER_LEVEL]
+
+
+def graph_search(
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+) -> list[dict]:
+    """Navigate the DAG level by level to find relevant leaf nodes.
+
+    1. Embed query as both single-vector and multi-vector
+    2. Start at roots, score with appropriate method
+    3. Threshold routing to pick candidates at each level
+    4. Descend until reaching leaves
+    5. Score leaves with MaxSim, return top-k with highlights
+    """
+    roots = get_roots()
+    if not roots:
+        return []
+
+    # Check if any roots have embeddings — if not, fall back to flat search
+    roots_with_embeddings = [r for r in roots if r.get("embedding_type")]
+    if not roots_with_embeddings:
+        return flat_search(query, top_k=top_k)
+
+    # Embed query in both modes
+    query_single = embed_single_query(query)
+    query_multi = embed_query(query)
+
+    # Start at roots — score them
+    current_level = roots_with_embeddings
+    leaf_candidates: list[tuple[dict, float]] = []
+
+    visited = set()
+    max_depth = 10  # safety limit
+
+    for _ in range(max_depth):
+        if not current_level:
+            break
+
+        # Score each node at this level
+        scored_nodes: list[dict] = []
+        for node in current_level:
+            if node["id"] in visited:
+                continue
+            visited.add(node["id"])
+
+            if not node.get("embedding_type"):
+                # No embedding — descend into children blindly
+                children = get_children(node["id"])
+                for child in children:
+                    if child.get("embedding_type"):
+                        scored_nodes.append({**child, "score": 0.5})
+                    else:
+                        # Leaf without embedding — can't score, skip
+                        pass
+                continue
+
+            score = score_node(query_single, query_multi, node["id"], node["embedding_type"])
+            scored_nodes.append({**node, "score": score})
+
+        if not scored_nodes:
+            break
+
+        # Separate leaves from branch nodes
+        next_level: list[dict] = []
+        for node in scored_nodes:
+            children = get_children(node["id"])
+            if not children:
+                # Leaf node — collect for final scoring
+                leaf_candidates.append((node, node["score"]))
+            else:
+                next_level.append(node)
+
+        # Select which branch nodes to descend into
+        if next_level:
+            next_level.sort(key=lambda x: x["score"], reverse=True)
+            selected = _select_candidates(query, next_level)
+
+            # Get children of selected nodes for next iteration
+            current_level = []
+            for node in selected:
+                current_level.extend(get_children(node["id"]))
+        else:
+            current_level = []
+
+    # Re-score leaf nodes with full MaxSim if they were scored with single-vector
+    final_scored: list[tuple[dict, float]] = []
+    for leaf, _ in leaf_candidates:
+        if leaf.get("embedding_type") == "multi":
+            doc_vectors = load_vectors(leaf["id"])
+            score = maxsim_score(query_multi, doc_vectors)
+            final_scored.append((leaf, score))
+        elif leaf.get("embedding_type") == "single":
+            vectors = load_vectors(leaf["id"])
+            score = cosine_score(query_single, vectors)
+            final_scored.append((leaf, score))
+
+    final_scored.sort(key=lambda x: x[1], reverse=True)
+    final_scored = final_scored[:top_k]
+
+    # Build results with highlights
+    results: list[dict] = []
+    for leaf, score in final_scored:
+        result = {
+            "node_id": leaf["id"],
+            "score": score,
+            "text": leaf.get("text", ""),
+            "name": leaf["name"],
+            "node_type": leaf["node_type"],
+            "token_count": leaf.get("token_count", 0),
+        }
+
+        # Only do word highlighting for multi-vector leaves
+        if leaf.get("embedding_type") == "multi" and leaf.get("text"):
+            doc_vectors = load_vectors(leaf["id"])
+            result["highlights"] = word_relevance(leaf["text"], query, query_multi, doc_vectors)
+        else:
+            result["highlights"] = []
+
+        results.append(result)
 
     return results
