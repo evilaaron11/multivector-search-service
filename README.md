@@ -2,7 +2,7 @@
 
 A knowledge graph search pipeline that organizes content into a directed acyclic graph (DAG) and navigates it level-by-level using embeddings. Upper-level nodes use single-vector embeddings for fast routing; leaf nodes use [Jina ColBERT-v2](https://jina.ai) multi-vector embeddings for precise token-level matching.
 
-The idea: instead of searching everything at once, narrow down through layers (domain -> source -> document -> chunk) the same way a human navigates information. This saves context for an LLM abstraction layer on top.
+The idea: instead of searching everything at once, narrow down through layers (source -> document -> chunk) the same way a human navigates information. RSS feed ingestion automatically groups articles under their source (e.g. "BBC Middle East", "Al Jazeera") with publication dates attached to every node. This saves context for an LLM abstraction layer on top.
 
 ## How it works
 
@@ -15,19 +15,22 @@ The idea: instead of searching everything at once, narrow down through layers (d
 Search starts at root nodes, scores them with cosine similarity against a single-vector query embedding, picks the best candidates via score thresholds, descends into their children, and repeats until reaching leaf nodes. Leaf nodes are scored with full MaxSim (token-level matching). An LLM fallback kicks in when scores are ambiguous.
 
 ```
-Query: "mortgage rates housing affordability"
+Query: "Iran war Strait of Hormuz shipping"
 
-Root level (cosine sim):
-  fed_rate_hike.md        → 0.82  ✓ descend
-  gpt5_launch.md          → 0.31  ✗ skip
-  us_israel_iran_war.md   → 0.28  ✗ skip
+Source level (cosine sim):
+  BBC Middle East           → 0.68  ✓ descend
+  The Guardian Middle East  → 0.61  ✓ descend
+  Ars Technica              → 0.38  ✗ skip
+  TechCrunch                → 0.29  ✗ skip
 
 Document level:
-  fed_rate_hike.md        → descend into chunks
+  Iran-backed Houthis join war [2026-03-28]       → 0.67  ✓ descend
+  Houthi threat to Red Sea shipping [2026-03-28]  → 0.63  ✓ descend
+  Funeral for journalists [2026-03-29]            → 0.46  ✗ skip
 
 Chunk level (MaxSim):
-  Housing Market (chunk 0) → 21.23  ← top result
-  Summary (chunk 0)        → 18.17
+  Houthis join war (chunk 0)         → 22.30  ← top result
+  Red Sea shipping threat (chunk 0)  → 22.11
   ...
 ```
 
@@ -75,11 +78,16 @@ pip install -r requirements.txt
 
 - Put your Jina API key in `apiKey.txt` in the project root.
 - Ensure the `claude` CLI is installed and authenticated (used for LLM calls during ingestion/routing).
+- The CLI path defaults to `claude` (expects it on `$PATH`). If your environment installs it elsewhere (e.g. `~/.claude/local/claude` on WSL, or a VS Code extension path), set the `CLAUDE_CLI_PATH` environment variable:
+  ```bash
+  export CLAUDE_CLI_PATH=/home/you/.claude/local/claude
+  ```
 
 ### Dependencies
 
 - `numpy` -- vector math
-- `requests` -- Jina API calls
+- `requests` -- Jina API calls, RSS feed fetching
+- `trafilatura` -- web article content extraction
 - `tokenizers` -- XLM-RoBERTa tokenizer for token-to-word mapping
 - `edgartools` -- SEC EDGAR filing fetcher
 - `claude` CLI -- LLM calls for summarization, routing, and dedup (via subprocess)
@@ -109,6 +117,31 @@ python main.py search "risk factors" --top-k 10
 
 # Flat search (brute-force all leaf chunks, no graph navigation)
 python main.py search "revenue growth drivers" --flat
+```
+
+### Ingest a single RSS feed
+
+```bash
+python main.py ingest-feed https://feeds.bbci.co.uk/news/world/middle_east/rss.xml --name "BBC Middle East"
+python main.py ingest-feed https://www.aljazeera.com/xml/rss/all.xml --name "Al Jazeera" --max-articles 5
+```
+
+Articles are placed under a **source category node** named after the feed, following the hierarchy: `source -> document -> chunk`. Each document node includes the article's publication date (e.g. `[2026-03-29]`) and each chunk is prefixed with the date so search results and LLM context include temporal information.
+
+### Ingest all feeds from a file
+
+```bash
+python main.py ingest-feeds feeds.json
+python main.py ingest-feeds feeds.json --max-articles 3
+python main.py ingest-feeds feeds.json --force   # re-ingest all
+```
+
+The feeds file is a JSON array of `{"url": "...", "name": "..."}` objects (see `feeds.json` for an example). Each feed gets its own source category node.
+
+### Ingest a web page by URL
+
+```bash
+python main.py ingest-url https://example.com/article
 ```
 
 ### Show graph structure
@@ -162,6 +195,10 @@ All settings are in `config.py`:
 | `SEARCH_MAX_CANDIDATES_PER_LEVEL` | `5` | Max nodes to explore per level |
 | `SEARCH_LLM_AMBIGUITY_RANGE` | `0.15` | Score range triggering LLM routing |
 | `DEDUP_SIMILARITY_THRESHOLD` | `0.92` | Cosine similarity for duplicate detection |
+| `CLAUDE_CLI_PATH` | `claude` | Path to Claude CLI binary (override via env var) |
+| `RSS_MAX_ARTICLES_PER_FEED` | `20` | Default max articles per feed |
+| `RSS_MIN_ARTICLE_WORDS` | `100` | Skip articles shorter than this |
+| `RSS_FETCH_DELAY` | `1.0` | Seconds between article fetches (rate limiting) |
 
 ## Project structure
 
@@ -179,6 +216,7 @@ embedded/
     graph.py           Graph traversal utilities (description, depth, leaves)
     llm.py             Claude CLI integration (summarization, routing, dedup)
     edgar_fetcher.py   SEC EDGAR 10-K fetcher via edgartools
+    web_fetcher.py     RSS/Atom feed parser, web article fetcher via trafilatura
 
   data/
     embeddings.db      SQLite (nodes + edges tables)
@@ -193,6 +231,7 @@ embedded/
     test_service.py    Ingestion, dedup, enrichment, search, delete
     test_chunker.py    Section parsing, token splitting
     test_edgar_fetcher.py  EDGAR API mocking
+    test_web_fetcher.py    RSS parsing, feed processing, article extraction
 ```
 
 ## Storage

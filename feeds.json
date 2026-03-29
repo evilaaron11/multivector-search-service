@@ -1,4 +1,8 @@
 [
   {"url": "https://techcrunch.com/feed/", "name": "TechCrunch"},
-  {"url": "https://feeds.arstechnica.com/arstechnica/technology-lab", "name": "Ars Technica"}
+  {"url": "https://feeds.arstechnica.com/arstechnica/technology-lab", "name": "Ars Technica"},
+  {"url": "https://www.aljazeera.com/xml/rss/all.xml", "name": "Al Jazeera"},
+  {"url": "https://www.theguardian.com/world/middleeast/rss", "name": "The Guardian Middle East"},
+  {"url": "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml", "name": "BBC Middle East"},
+  {"url": "https://www.middleeasteye.net/rss", "name": "Middle East Eye"}
 ]

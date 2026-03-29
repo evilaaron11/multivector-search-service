@@ -6,6 +6,8 @@ Ties together chunking, storage, embedding, LLM routing, and search.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable
 
@@ -438,6 +440,57 @@ def ingest_url(
     )
 
 
+def _parse_pub_date(raw: str) -> str:
+    """Parse an RSS/Atom date string into 'YYYY-MM-DD' format.
+
+    Handles RFC 2822 (RSS) and ISO 8601 (Atom) formats.
+    Returns the original string if parsing fails.
+    """
+    if not raw:
+        return ""
+    # Try RFC 2822 (e.g. "Sat, 29 Mar 2026 14:00:00 GMT")
+    try:
+        dt = parsedate_to_datetime(raw)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    # Try ISO 8601 (e.g. "2026-03-29T14:00:00Z")
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(raw.strip(), fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return raw.strip()
+
+
+def _find_or_create_source_node(feed_name: str) -> int:
+    """Find an existing source category node by name, or create one.
+
+    Source nodes act as the top-level grouping for all articles from a feed
+    (e.g., "Al Jazeera", "BBC Middle East"), following the hierarchy:
+    source -> document -> chunk.
+    """
+    # Look for an existing category node with this exact name
+    all_nodes = store.get_all_nodes(node_type="category")
+    for node in all_nodes:
+        if node["name"] == feed_name:
+            return node["id"]
+
+    # Create a new source category node
+    source_id = store.insert_node(
+        node_type="category",
+        name=feed_name,
+        description=f"News articles from {feed_name}",
+    )
+    # Embed the source description so it participates in graph search
+    desc = f"News articles from {feed_name}"
+    vec = embedder.embed_single_vector([desc])[0]
+    store.save_vectors(source_id, vec)
+    store.update_node(source_id, embedding_type="single")
+    return source_id
+
+
 def ingest_feed(
     feed_url: str,
     feed_name: str | None = None,
@@ -445,17 +498,31 @@ def ingest_feed(
     confirm_callback: ConfirmCallback | None = None,
     force: bool = False,
 ) -> list[IngestResult]:
-    """Fetch all articles from an RSS feed and ingest them."""
+    """Fetch all articles from an RSS feed and ingest them.
+
+    Articles are placed under a source category node named after the feed,
+    following the hierarchy: source -> document -> chunk.
+    """
     store.init_db()
 
     articles = web_fetcher.process_feed(feed_url, feed_name=feed_name, max_articles=max_articles)
     results: list[IngestResult] = []
 
+    # Find or create the source-level category node for this feed
+    source_name = feed_name or feed_url
+    source_node_id = _find_or_create_source_node(source_name)
+
     for i, (chunks, metadata) in enumerate(articles):
         url = metadata.get("url", "")
         title = metadata.get("title", "Untitled")
         source = metadata.get("source_name", "")
+        published = metadata.get("published", "")
         print(f"  [{i+1}/{len(articles)}] Ingesting: {title}")
+
+        # Parse published date into a clean format
+        pub_date_str = ""
+        if published:
+            pub_date_str = _parse_pub_date(published)
 
         # URL dedup
         existing = store.find_node_by_source_url(url)
@@ -470,21 +537,23 @@ def ingest_feed(
                 ))
                 continue
 
-        name = f"{source}: {title}" if source else title
-        chunk_texts = [c["text"] for c in chunks]
+        date_tag = f" [{pub_date_str}]" if pub_date_str else ""
+        name = f"{source}: {title}{date_tag}" if source else f"{title}{date_tag}"
+        # Prepend date context to chunk texts so embeddings and LLM see it
+        date_prefix = f"Published: {pub_date_str}\n\n" if pub_date_str else ""
+        chunk_texts = [date_prefix + c["text"] for c in chunks]
         full_text = "\n\n".join(chunk_texts[:5])
 
         try:
             doc_summary = generate_leaf_description(full_text)
-            description = f"Source: {url}\n\n{doc_summary}"
+            date_line = f"Published: {pub_date_str}\n" if pub_date_str else ""
+            description = f"Source: {url}\n{date_line}\n{doc_summary}"
             summary_vector = embedder.embed_single_vector([doc_summary])[0]
 
             if not force and _check_duplicates(doc_summary, summary_vector):
                 print(f"    Skipped (duplicate content)")
                 results.append(IngestResult(node_id=-1, name=name, num_chunks=0, sections=[]))
                 continue
-
-            parent_id = _find_best_parent(doc_summary, summary_vector, confirm_callback=None)
 
             doc_node_id = store.insert_node(
                 node_type="document",
@@ -494,12 +563,8 @@ def ingest_feed(
             )
             store.save_vectors(doc_node_id, summary_vector)
 
-            is_new_branch = False
-            if parent_id is not None:
-                store.insert_edge(parent_id, doc_node_id)
-                parent = store.get_node(parent_id)
-                if parent and parent["node_type"] == "category":
-                    is_new_branch = True
+            # Attach to the source category node
+            store.insert_edge(source_node_id, doc_node_id)
 
             embeddings = embedder.embed_documents(chunk_texts)
 
@@ -509,7 +574,7 @@ def ingest_feed(
                 chunk_node_id = store.insert_node(
                     node_type="chunk",
                     name=f"{chunk['section']} (chunk {chunk['chunk_index']})",
-                    text=chunk["text"],
+                    text=chunk_texts[j],
                     embedding_type="multi",
                     token_count=chunk["token_count"],
                 )
@@ -528,8 +593,8 @@ def ingest_feed(
                 name=name,
                 num_chunks=len(chunks),
                 sections=sections,
-                parent_node_id=parent_id,
-                is_new_branch=is_new_branch,
+                parent_node_id=source_node_id,
+                is_new_branch=False,
             ))
         except Exception as e:
             print(f"    Error: {e}")

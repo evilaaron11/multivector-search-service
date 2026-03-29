@@ -340,6 +340,7 @@ def cmd_ingest_url(args: argparse.Namespace) -> None:
 def cmd_ingest_feed(args: argparse.Namespace) -> None:
     results = service.ingest_feed(
         args.feed_url,
+        feed_name=getattr(args, "name", None),
         max_articles=args.max_articles,
         confirm_callback=None,
         force=args.force,
@@ -443,6 +444,8 @@ def build_parser() -> argparse.ArgumentParser:
     # ingest-feed
     p_feed = subparsers.add_parser("ingest-feed", help="Ingest articles from an RSS feed")
     p_feed.add_argument("feed_url", help="URL of the RSS/Atom feed")
+    p_feed.add_argument("--name", default=None,
+                         help="Display name for the feed source")
     p_feed.add_argument("--max-articles", type=int, default=None,
                          help="Max articles to ingest (default: config value)")
     p_feed.add_argument("--force", action="store_true",

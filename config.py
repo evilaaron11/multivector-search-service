@@ -23,7 +23,7 @@ JINA_SINGLE_VECTOR_MODEL = "jina-embeddings-v3"
 JINA_SINGLE_VECTOR_DIMENSIONS = 1024
 
 # Claude CLI (for LLM calls via subprocess)
-CLAUDE_CLI_PATH = "claude"
+CLAUDE_CLI_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
 
 # Search
 DEFAULT_TOP_K = 5
